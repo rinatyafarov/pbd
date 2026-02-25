@@ -9,9 +9,33 @@ DB_USER = "system"
 DB_PASSWORD = "toor"
 DB_DSN = "localhost:1521/XEPDB1"  # host:port/service_name
 
+# Глобальный пул соединений (опционально, для производительности)
+connection_pool = None
+
+
+def init_pool(min_connections=1, max_connections=5):
+    """Инициализирует пул соединений (для продакшена)"""
+    global connection_pool
+    try:
+        connection_pool = oracledb.create_pool(
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dsn=DB_DSN,
+            min=min_connections,
+            max=max_connections,
+            increment=1,
+            getmode=oracledb.POOL_GETMODE_WAIT
+        )
+        print(f"Connection pool initialized with {min_connections}-{max_connections} connections")
+    except Exception as e:
+        print(f"Failed to initialize connection pool: {e}")
+        connection_pool = None
+
 
 def get_connection():
     """Возвращает новое соединение с базой данных."""
+    if connection_pool:
+        return connection_pool.acquire()
     return oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
 
 
@@ -81,3 +105,18 @@ def call_function(func_name, return_type, params=None):
             else:
                 cur.callproc(func_name, [result])
             return result.getvalue()
+
+
+def execute_many(query, params_list):
+    """
+    Выполняет массовую вставку/обновление.
+    params_list -- список списков параметров
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(query, params_list)
+            conn.commit()
+
+
+# Инициализируем пул при импорте (опционально)
+# init_pool()

@@ -3,9 +3,11 @@ import db
 import json
 import traceback
 import time
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = "sliding_puzzle_secret_key"
+app.config['SESSION_TIMEOUT_MINUTES'] = 30  # Таймаут сессии в минутах
 
 
 # ================================================================
@@ -40,6 +42,155 @@ def ensure_db_connection():
             else:
                 return False
     return False
+
+
+def cleanup_stale_sessions(timeout_minutes=None):
+    """
+    Завершает все активные сессии, которые были бездействия дольше timeout_minutes.
+    Вызывается перед каждым запросом.
+    """
+    if timeout_minutes is None:
+        timeout_minutes = app.config['SESSION_TIMEOUT_MINUTES']
+
+    try:
+        if not ensure_db_connection():
+            return
+
+        # Получаем статус 'abandoned' для завершения
+        status_abandoned = db.fetch_one(
+            "SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'"
+        )
+        if not status_abandoned:
+            # Создаем, если не существует
+            db.execute_query(
+                "INSERT INTO GAME_STATUSES (ID, NAME) VALUES (SEQ_GAME_STATUSES.NEXTVAL, 'abandoned')"
+            )
+            status_abandoned = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
+
+        # Находим все активные сессии, у которых LAST_ACTIVITY_AT старше timeout_minutes
+        # Используем интервал в минутах для Oracle
+        stale_sessions = db.fetch_all(
+            f"""SELECT GS.ID, GS.USER_ID, GA.ID as ATTEMPT_ID
+                FROM GAME_SESSIONS GS
+                JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+                JOIN GAME_ATTEMPTS GA ON GS.ID = GA.SESSION_ID 
+                    AND GA.STATUS_ID = GST.ID
+                WHERE GST.NAME = 'active'
+                AND GS.LAST_ACTIVITY_AT < SYSTIMESTAMP - INTERVAL '{timeout_minutes}' MINUTE"""
+        )
+
+        for session_data in stale_sessions:
+            # Завершаем попытку
+            db.execute_query(
+                """UPDATE GAME_ATTEMPTS 
+                   SET STATUS_ID = :1, FINISHED_AT = SYSTIMESTAMP 
+                   WHERE ID = :2""",
+                [status_abandoned["id"], session_data["attempt_id"]]
+            )
+
+            # Завершаем сессию
+            db.execute_query(
+                """UPDATE GAME_SESSIONS 
+                   SET STATUS_ID = :1, END_TIME = SYSDATE 
+                   WHERE ID = :2""",
+                [status_abandoned["id"], session_data["id"]]
+            )
+
+            # Если это текущая сессия пользователя, очищаем её из сессии Flask
+            current_session_id = get_active_session_id()
+            if current_session_id == session_data["id"]:
+                session.pop("game_session_id", None)
+
+            # Логируем событие (если есть таблица LOGS)
+            try:
+                db.execute_query(
+                    """INSERT INTO LOGS (ID, LOG_DATE, SESSION_ID, LOG_TYPE, PROCEDURE_NAME, MESSAGE)
+                       VALUES (SEQ_LOGS.NEXTVAL, SYSDATE, :1, 'INFO', 'AUTO_CLEANUP', :2)""",
+                    [session_data["id"], f"Session auto-closed after {timeout_minutes} minutes of inactivity"]
+                )
+            except:
+                pass  # Игнорируем ошибки логирования
+
+        if stale_sessions:
+            print(f"Auto-closed {len(stale_sessions)} stale sessions")
+
+    except Exception as e:
+        print(f"Error in cleanup_stale_sessions: {e}")
+
+
+def check_current_session_valid():
+    """Проверяет, не истекла ли текущая активная сессия по времени"""
+    gsid = get_active_session_id()
+    if not gsid:
+        return True  # Нет активной сессии - ок
+
+    try:
+        session_data = db.fetch_one(
+            """SELECT GS.LAST_ACTIVITY_AT, GST.NAME as STATUS_NAME
+               FROM GAME_SESSIONS GS
+               JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+               WHERE GS.ID = :1""",
+            [gsid]
+        )
+
+        if not session_data:
+            # Сессия не найдена
+            session.pop("game_session_id", None)
+            return False
+
+        if session_data["status_name"] != 'active':
+            # Сессия уже не активна
+            session.pop("game_session_id", None)
+            return False
+
+        # Проверяем время последней активности
+        last_activity = session_data["last_activity_at"]
+        if hasattr(last_activity, 'timestamp'):
+            # Если это datetime объект
+            timeout_minutes = app.config['SESSION_TIMEOUT_MINUTES']
+            if datetime.now() - last_activity > timedelta(minutes=timeout_minutes):
+                # Завершаем сессию
+                status_abandoned = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
+                if status_abandoned:
+                    # Получаем ID попытки
+                    attempt = db.fetch_one(
+                        "SELECT ID FROM GAME_ATTEMPTS WHERE SESSION_ID = :1 AND STATUS_ID = (SELECT ID FROM GAME_STATUSES WHERE NAME='active')",
+                        [gsid]
+                    )
+                    if attempt:
+                        db.execute_query(
+                            "UPDATE GAME_ATTEMPTS SET STATUS_ID = :1, FINISHED_AT = SYSTIMESTAMP WHERE ID = :2",
+                            [status_abandoned["id"], attempt["id"]]
+                        )
+
+                    db.execute_query(
+                        "UPDATE GAME_SESSIONS SET STATUS_ID = :1, END_TIME = SYSDATE WHERE ID = :2",
+                        [status_abandoned["id"], gsid]
+                    )
+
+                session.pop("game_session_id", None)
+                return False
+    except Exception as e:
+        print(f"Error in check_current_session_valid: {e}")
+        return False
+
+    return True
+
+
+@app.before_request
+def before_request():
+    """Выполняется перед каждым запросом"""
+    # Очищаем старые сессии (раз в час примерно)
+    if not hasattr(app, 'last_cleanup') or time.time() - app.last_cleanup > 3600:
+        cleanup_stale_sessions()
+        app.last_cleanup = time.time()
+
+    # Проверяем валидность текущей сессии
+    if get_current_user_id() and get_active_session_id():
+        if not check_current_session_valid():
+            # Если сессия невалидна, редиректим на главную
+            if request.endpoint not in ['login', 'static'] and not request.path.startswith('/static'):
+                return redirect(url_for('index'))
 
 
 def get_active_attempt(session_id):
@@ -266,11 +417,16 @@ def login():
                 )
             session["user_id"] = user["id"]
             session["username"] = user["username"]
-            # Восстановить активную сессию если есть
+
+            # Восстановить активную сессию если есть и она не устарела (менее 30 минут назад)
             active = db.fetch_one(
-                "SELECT GS.ID FROM GAME_SESSIONS GS "
-                "JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID "
-                "WHERE GS.USER_ID = :1 AND GST.NAME = 'active' AND ROWNUM = 1",
+                """SELECT GS.ID 
+                   FROM GAME_SESSIONS GS
+                   JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+                   WHERE GS.USER_ID = :1 
+                   AND GST.NAME = 'active' 
+                   AND GS.LAST_ACTIVITY_AT > SYSTIMESTAMP - INTERVAL '30' MINUTE
+                   AND ROWNUM = 1""",
                 [user["id"]]
             )
             if active:
@@ -320,7 +476,18 @@ def index():
     active_game = None
     gsid = get_active_session_id()
     if gsid:
-        active_game = get_active_attempt(gsid)
+        # Проверяем, что сессия действительно активна
+        active_check = db.fetch_one(
+            """SELECT GS.ID 
+               FROM GAME_SESSIONS GS
+               JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+               WHERE GS.ID = :1 AND GST.NAME = 'active'""",
+            [gsid]
+        )
+        if active_check:
+            active_game = get_active_attempt(gsid)
+        else:
+            session.pop("game_session_id", None)
 
     return render_template(
         "index.html",
@@ -341,8 +508,19 @@ def start_game(puzzle_id):
         return redirect(url_for("login"))
 
     gsid = get_active_session_id()
-    if gsid and get_active_attempt(gsid):
-        return redirect(url_for("game"))
+    if gsid:
+        # Проверяем, активна ли существующая сессия
+        active_check = db.fetch_one(
+            """SELECT GS.ID 
+               FROM GAME_SESSIONS GS
+               JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+               WHERE GS.ID = :1 AND GST.NAME = 'active'""",
+            [gsid]
+        )
+        if active_check:
+            return redirect(url_for("game"))
+        else:
+            session.pop("game_session_id", None)
 
     user_id = get_current_user_id()
 
@@ -470,6 +648,10 @@ def game():
     if not gsid:
         return redirect(url_for("index"))
 
+    # Дополнительная проверка активности сессии
+    if not check_current_session_valid():
+        return redirect(url_for("index"))
+
     attempt = get_active_attempt(gsid)
     if not attempt:
         session.pop("game_session_id", None)
@@ -514,7 +696,6 @@ def game():
     elapsed_seconds = 0
     if start_time_row and start_time_row["started_at"]:
         # Вычисляем прошедшее время в секундах
-        from datetime import datetime
         start_time = start_time_row["started_at"]
         if hasattr(start_time, 'timestamp'):
             # Если это datetime объект
@@ -544,14 +725,19 @@ def game():
         username=session.get("username")
     )
 
+
 # ================================================================
-# ИГРА -- ХОД (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- ХОД
 # ================================================================
 
 @app.route("/game/move", methods=["POST"])
 def make_move():
     if not get_current_user_id():
         return jsonify({"error": "Не авторизован"}), 401
+
+    # Проверяем валидность сессии
+    if not check_current_session_valid():
+        return jsonify({"error": "Сессия истекла по времени"}), 401
 
     tile = request.json.get("tile")
     if tile is None:
@@ -642,6 +828,7 @@ def make_move():
         [new_state_json, misplaced, manhattan, next_idx, attempt["id"]]
     )
 
+    # Обновляем время последней активности
     db.execute_query(
         "UPDATE GAME_SESSIONS SET STEPS_COUNT = STEPS_COUNT + 1, LAST_ACTIVITY_AT = SYSTIMESTAMP WHERE ID = :1",
         [gsid]
@@ -689,7 +876,7 @@ def make_move():
 
 
 # ================================================================
-# ИГРА -- UNDO (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- UNDO
 # ================================================================
 
 @app.route("/game/undo", methods=["POST"])
@@ -698,11 +885,14 @@ def undo_move():
     if not get_current_user_id():
         return jsonify({"error": "Не авторизован"}), 401
 
+    # Проверяем валидность сессии
+    if not check_current_session_valid():
+        return jsonify({"error": "Сессия истекла по времени"}), 401
+
     gsid = get_active_session_id()
     if not gsid:
         return jsonify({"error": "Нет активной игровой сессии"}), 400
 
-    # Принудительно проверяем соединение
     if not ensure_db_connection():
         return jsonify({"error": "Потеряно соединение с БД"}), 500
 
@@ -810,7 +1000,7 @@ def undo_move():
 
 
 # ================================================================
-# ИГРА -- REDO (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- REDO
 # ================================================================
 
 @app.route("/game/redo", methods=["POST"])
@@ -818,6 +1008,10 @@ def redo_move():
     print("=== REDO CALLED ===")
     if not get_current_user_id():
         return jsonify({"error": "Не авторизован"}), 401
+
+    # Проверяем валидность сессии
+    if not check_current_session_valid():
+        return jsonify({"error": "Сессия истекла по времени"}), 401
 
     gsid = get_active_session_id()
     if not gsid:
@@ -935,6 +1129,10 @@ def get_hint():
     if not get_current_user_id():
         return jsonify({"error": "Не авторизован"}), 401
 
+    # Проверяем валидность сессии
+    if not check_current_session_valid():
+        return jsonify({"error": "Сессия истекла по времени"}), 401
+
     gsid = get_active_session_id()
     if not gsid:
         return jsonify({"error": "Нет активной игровой сессии"}), 400
@@ -976,20 +1174,31 @@ def game_over():
 
     gsid = get_active_session_id()
     if gsid:
-        status_abandoned_row = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
-        if not status_abandoned_row:
-            db.execute_query("INSERT INTO GAME_STATUSES (ID, NAME) VALUES (SEQ_GAME_STATUSES.NEXTVAL, 'abandoned')")
-            status_abandoned_row = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
-        status_abandoned = status_abandoned_row["id"]
+        # Проверяем, активна ли сессия
+        active_check = db.fetch_one(
+            """SELECT GS.ID 
+               FROM GAME_SESSIONS GS
+               JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+               WHERE GS.ID = :1 AND GST.NAME = 'active'""",
+            [gsid]
+        )
 
-        db.execute_query(
-            "UPDATE GAME_ATTEMPTS SET STATUS_ID=:1, FINISHED_AT=SYSTIMESTAMP WHERE SESSION_ID=:2",
-            [status_abandoned, gsid]
-        )
-        db.execute_query(
-            "UPDATE GAME_SESSIONS SET STATUS_ID=:1, END_TIME=SYSDATE WHERE ID=:2",
-            [status_abandoned, gsid]
-        )
+        if active_check:
+            status_abandoned_row = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
+            if not status_abandoned_row:
+                db.execute_query("INSERT INTO GAME_STATUSES (ID, NAME) VALUES (SEQ_GAME_STATUSES.NEXTVAL, 'abandoned')")
+                status_abandoned_row = db.fetch_one("SELECT ID FROM GAME_STATUSES WHERE NAME='abandoned'")
+            status_abandoned = status_abandoned_row["id"]
+
+            db.execute_query(
+                "UPDATE GAME_ATTEMPTS SET STATUS_ID=:1, FINISHED_AT=SYSTIMESTAMP WHERE SESSION_ID=:2",
+                [status_abandoned, gsid]
+            )
+            db.execute_query(
+                "UPDATE GAME_SESSIONS SET STATUS_ID=:1, END_TIME=SYSDATE WHERE ID=:2",
+                [status_abandoned, gsid]
+            )
+
         session.pop("game_session_id", None)
 
     return redirect(url_for("index"))
@@ -1025,6 +1234,7 @@ def leaderboard():
     )
     return render_template("leaderboard.html", players=players, username=session.get("username"))
 
+
 # ================================================================
 # ИСТОРИЯ
 # ================================================================
@@ -1050,8 +1260,6 @@ def history():
         [user_id]
     )
     return render_template("history.html", games=games, username=session.get("username"))
-
-
 
 
 # ================================================================
@@ -1097,7 +1305,7 @@ def game_details(session_id):
 
     # Форматируем данные
     start_time = game["start_time"]
-    end_time   = game["end_time"]
+    end_time = game["end_time"]
 
     def fmt_date(d):
         if not d:
@@ -1117,24 +1325,24 @@ def game_details(session_id):
     for s in steps:
         step_time = s["step_time"]
         steps_list.append({
-            "index":     s["step_index"],
-            "action":    s["action"],
-            "tile":      s["tile_value"],
+            "index": s["step_index"],
+            "action": s["action"],
+            "tile": s["tile_value"],
             "direction": s["direction"],
-            "time":      fmt_time(step_time),
+            "time": fmt_time(step_time),
         })
 
     return jsonify({
-        "session_id":  session_id,
-        "start_time":  fmt_date(start_time),
-        "end_time":    fmt_date(end_time),
-        "status":      game["status"],
+        "session_id": session_id,
+        "start_time": fmt_date(start_time),
+        "end_time": fmt_date(end_time),
+        "status": game["status"],
         "steps_count": game["steps_count"],
-        "grid_size":   game["grid_size"],
-        "difficulty":  game["difficulty"],
+        "grid_size": game["grid_size"],
+        "difficulty": game["difficulty"],
         "time_minutes": game["time_minutes"],
-        "seed":        game["seed"],
-        "steps":       steps_list,
+        "seed": game["seed"],
+        "steps": steps_list,
     })
 
 
@@ -1187,22 +1395,22 @@ def export_game(session_id):
     export_data = {
         "game": {
             "session_id": session_id,
-            "seed":        game["seed"],
-            "grid_size":   game["grid_size"],
-            "difficulty":  game["difficulty"],
-            "status":      game["status"],
+            "seed": game["seed"],
+            "grid_size": game["grid_size"],
+            "difficulty": game["difficulty"],
+            "status": game["status"],
             "steps_count": game["steps_count"],
-            "start_time":  fmt(game["start_time"]),
-            "end_time":    fmt(game["end_time"]),
+            "start_time": fmt(game["start_time"]),
+            "end_time": fmt(game["end_time"]),
         },
         "moves": [
             {
-                "step":      s["step_index"],
-                "action":    s["action"],
-                "tile":      s["tile_value"],
+                "step": s["step_index"],
+                "action": s["action"],
+                "tile": s["tile_value"],
                 "direction": s["direction"],
-                "state":     s["state_after"],
-                "time":      fmt(s["step_time"]),
+                "state": s["state_after"],
+                "time": fmt(s["step_time"]),
             }
             for s in steps
         ]
@@ -1219,8 +1427,11 @@ def export_game(session_id):
     )
     return response
 
+
 # ================================================================
-# ИСТОРИЯ -- ДЕТАЛИ ИГРЫ (AJAX)
+# ЗАПУСК ПРИЛОЖЕНИЯ
+# ================================================================
 
 if __name__ == "__main__":
+    app.last_cleanup = time.time()  # Инициализируем время последней очистки
     app.run(debug=True, port=5000)
