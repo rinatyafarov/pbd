@@ -5,19 +5,19 @@
 {% block content %}
 
 <section class="section">
-    <div class="section-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
-        <h2 class="section-title" style="margin-bottom:0;">Таблица лидеров</h2>
+    <div class="section-header">
+        <h2 class="section-title">Таблица лидеров</h2>
         
-        <!-- Фильтр по размеру поля - сдвинут вправо -->
-        <div class="filter-group" style="display:flex; gap:1rem; align-items:center; margin-left:auto;">
-            <div class="filter-label" style="font-weight:500; color:var(--text-muted);">Размер поля:</div>
+        <!-- Фильтр по размеру поля -->
+        <div class="size-filter-container">
+            <span class="filter-label">Размер поля:</span>
             <div class="size-filter-bar" id="size-filter-bar">
                 <a href="{{ url_for('leaderboard', sort=current_sort) }}" 
                    class="size-filter-btn {% if not current_size %}active{% endif %}">
                     Все
                 </a>
                 {% for size in sizes %}
-                    {% if size.grid_size <= 6 %}  <!-- Фильтруем только размеры до 6 -->
+                    {% if size.grid_size <= 6 %}
                     <a href="{{ url_for('leaderboard', size=size.grid_size, sort=current_sort) }}" 
                        class="size-filter-btn {% if current_size == size.grid_size %}active{% endif %}">
                         {{ size.grid_size }}×{{ size.grid_size }}
@@ -29,7 +29,7 @@
     </div>
 
     <!-- Переключатель между таблицами -->
-    <div class="tab-bar" style="display:flex; gap:0.5rem; margin-bottom:1.5rem; border-bottom:2px solid var(--border);">
+    <div class="tab-bar">
         <button class="tab-btn {% if current_sort == 'success_rate' %}active{% endif %}" 
                 onclick="window.location.href='{{ url_for('leaderboard', size=current_size, sort='success_rate') }}'">
             📊 По успешности
@@ -140,9 +140,9 @@
 
     <!-- Дополнительная статистика по размеру -->
     {% if current_size %}
-    <div class="stats-grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin-top:2rem;">
-        <div class="stat-card" style="text-align:center; padding:1rem;">
-            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-value" style="color:var(--accent);">
                 {% set best_time = players | selectattr('best_time_seconds') | map(attribute='best_time_seconds') | min %}
                 {% if best_time %}
                     {% set minutes = (best_time // 60) | int %}
@@ -154,14 +154,14 @@
             </div>
             <div class="stat-label">Лучшее время</div>
         </div>
-        <div class="stat-card" style="text-align:center; padding:1rem;">
-            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+        <div class="stat-card">
+            <div class="stat-value" style="color:var(--accent);">
                 {{ players | selectattr('best_steps') | map(attribute='best_steps') | min | default('—') }}
             </div>
             <div class="stat-label">Минимум ходов</div>
         </div>
-        <div class="stat-card" style="text-align:center; padding:1rem;">
-            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+        <div class="stat-card">
+            <div class="stat-value" style="color:var(--accent);">
                 {{ players | selectattr('success_rate') | map(attribute='success_rate') | max | round(1) }}%
             </div>
             <div class="stat-label">Макс. успешность</div>
@@ -181,11 +181,72 @@
 </section>
 
 <style>
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+.section-title {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.size-filter-container {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    background: var(--surface2);
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius);
+}
+
+.filter-label {
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.size-filter-bar {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.size-filter-btn {
+    padding: 0.3rem 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 0.85rem;
+    text-decoration: none;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+
+.size-filter-btn:hover {
+    background: var(--surface3);
+    border-color: var(--accent);
+}
+
+.size-filter-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+}
+
 .tab-bar {
     display: flex;
     gap: 0.5rem;
+    margin-bottom: 1.5rem;
     border-bottom: 2px solid var(--border);
     padding-bottom: 0.5rem;
+    flex-wrap: wrap;
 }
 
 .tab-btn {
@@ -218,39 +279,18 @@
     color: var(--accent);
 }
 
-.size-filter-bar {
-    display: flex;
-    gap: 0.3rem;
-    flex-wrap: wrap;
-}
-
-.size-filter-btn {
-    padding: 0.3rem 0.8rem;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    border-radius: var(--radius);
-    cursor: pointer;
-    font-size: 0.85rem;
-    text-decoration: none;
-    transition: all 0.2s;
-}
-
-.size-filter-btn:hover {
-    background: var(--surface2);
-    border-color: var(--accent);
-}
-
-.size-filter-btn.active {
-    background: var(--accent);
-    color: white;
-    border-color: var(--accent);
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1rem;
+    margin-top: 2rem;
 }
 
 .stat-card {
     background: var(--surface2);
     border-radius: var(--radius);
     padding: 1rem;
+    text-align: center;
 }
 
 .stat-value {
@@ -266,21 +306,21 @@
     margin-top: 0.3rem;
 }
 
-/* Стили для заголовка */
-.section-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1.5rem;
-}
-
-.section-title {
-    margin-bottom: 0;
-}
-
-.filter-label {
-    font-weight: 500;
-    color: var(--text-muted);
+/* Адаптивность для мобильных устройств */
+@media (max-width: 768px) {
+    .section-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .size-filter-container {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+    
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
 }
 </style>
 
