@@ -262,9 +262,19 @@ def read_clob(value):
                 value.close()
             except:
                 pass
+            # Если результат - байты, декодируем
+            if isinstance(result, bytes):
+                result = result.decode('utf-8')
             return result if result else ""
         except Exception as e:
             print(f"Error reading CLOB: {e}")
+            # Пробуем альтернативный метод
+            try:
+                if hasattr(value, 'read'):
+                    value = str(value)
+                    return value
+            except:
+                pass
             return ""
 
     # В остальных случаях просто преобразуем в строку
@@ -894,7 +904,7 @@ def game():
 
 
 # ================================================================
-# ИГРА -- ХОД (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- ХОД
 # ================================================================
 
 @app.route("/game/move", methods=["POST"])
@@ -1053,7 +1063,7 @@ def make_move():
 
 
 # ================================================================
-# ИГРА -- UNDO (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- UNDO
 # ================================================================
 
 @app.route("/game/undo", methods=["POST"])
@@ -1223,14 +1233,15 @@ def redo_move():
         return jsonify({"error": "Потеряно соединение с БД"}), 500
 
     try:
-        # Получаем данные игры
+        # Получаем данные игры - добавляем CURRENT_STATE для отладки
         game_data = db.fetch_one("""
             SELECT 
                 GA.ID as attempt_id,
                 GA.UNDO_POINTER,
                 GA.INITIAL_MANHATTAN_DISTANCE,
                 PS.GRID_SIZE,
-                PZ.TARGET_STATE
+                PZ.TARGET_STATE,
+                GA.CURRENT_STATE
             FROM GAME_ATTEMPTS GA
             JOIN GAME_STATUSES GST ON GA.STATUS_ID = GST.ID
             JOIN PUZZLES PZ ON GA.PUZZLE_ID = PZ.ID
@@ -1268,11 +1279,25 @@ def redo_move():
             print(f"ERROR: Next state is empty for attempt {attempt_id}, step {next_idx}")
             return jsonify({"error": "Следующее состояние повреждено (пустое)"}), 500
 
-        # Преобразуем target_state в строку
+        # Преобразуем target_state в строку - ИСПРАВЛЕНО
         target_state_str = read_clob(target_state)
+
+        # Если target_state_str пустой или содержит только пробелы, пробуем получить его из PUZZLES еще раз
         if not target_state_str or target_state_str.isspace():
-            print("ERROR: Target state is empty")
-            return jsonify({"error": "Целевое состояние повреждено"}), 500
+            print("WARNING: Target state is empty, trying to fetch again...")
+            # Пробуем получить целевое состояние напрямую из PUZZLES
+            target_direct = db.fetch_one("""
+                SELECT TO_CHAR(TARGET_STATE) as target_str 
+                FROM PUZZLES PZ
+                JOIN GAME_ATTEMPTS GA ON GA.PUZZLE_ID = PZ.ID
+                WHERE GA.ID = :1
+            """, [attempt_id])
+            if target_direct and target_direct["target_str"]:
+                target_state_str = target_direct["target_str"]
+                print(f"Successfully fetched target state directly: {target_state_str[:50]}...")
+            else:
+                print("ERROR: Still cannot get target state")
+                return jsonify({"error": "Целевое состояние повреждено"}), 500
 
         # Парсим состояния
         _, flat = parse_board(next_state_str, grid_size)
@@ -1283,7 +1308,7 @@ def redo_move():
             return jsonify({"error": "Ошибка парсинга состояния доски"}), 500
 
         if not tgt_flat:
-            print("ERROR: Failed to parse target state")
+            print(f"ERROR: Failed to parse target state: {target_state_str[:100]}...")
             return jsonify({"error": "Ошибка парсинга целевого состояния"}), 500
 
         misplaced, manhattan, _ = compute_metrics(flat, tgt_flat, grid_size)
@@ -1466,6 +1491,64 @@ def restart_game():
 
     except Exception as e:
         print(f"RESTART error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ================================================================
+# ДИАГНОСТИЧЕСКАЯ ФУНКЦИЯ
+# ================================================================
+
+@app.route("/game/diagnose", methods=["GET"])
+def diagnose_game():
+    """Диагностическая функция для проверки состояния игры"""
+    if not get_current_user_id():
+        return jsonify({"error": "Не авторизован"}), 401
+
+    gsid = get_active_session_id()
+    if not gsid:
+        return jsonify({"error": "Нет активной игровой сессии"}), 400
+
+    try:
+        # Получаем информацию о попытке и пазле
+        data = db.fetch_one("""
+            SELECT 
+                GA.ID as attempt_id,
+                GA.UNDO_POINTER,
+                PS.GRID_SIZE,
+                DL.NAME as DIFFICULTY,
+                SUBSTR(TO_CHAR(GA.CURRENT_STATE), 1, 100) as current_state_preview,
+                SUBSTR(TO_CHAR(PZ.TARGET_STATE), 1, 100) as target_state_preview,
+                PZ.ID as puzzle_id
+            FROM GAME_ATTEMPTS GA
+            JOIN GAME_STATUSES GST ON GA.STATUS_ID = GST.ID
+            JOIN PUZZLES PZ ON GA.PUZZLE_ID = PZ.ID
+            JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+            JOIN DIFFICULTY_LEVELS DL ON PZ.DIFFICULTY_ID = DL.ID
+            WHERE GA.SESSION_ID = :1 AND GST.NAME = 'active' AND ROWNUM = 1
+        """, [gsid])
+
+        # Получаем все шаги
+        steps = db.fetch_all("""
+            SELECT STEP_INDEX, IS_ACTUAL, TILE_VALUE,
+                   SUBSTR(TO_CHAR(STATE_AFTER), 1, 50) as state_preview
+            FROM GAME_STEPS
+            WHERE ATTEMPT_ID = :1
+            ORDER BY STEP_INDEX
+        """, [data["attempt_id"]])
+
+        return jsonify({
+            "session_id": gsid,
+            "attempt_id": data["attempt_id"],
+            "puzzle_id": data["puzzle_id"],
+            "grid_size": data["grid_size"],
+            "difficulty": data["difficulty"],
+            "undo_pointer": data["undo_pointer"],
+            "current_state_preview": data["current_state_preview"],
+            "target_state_preview": data["target_state_preview"],
+            "steps": steps,
+            "steps_count": len(steps)
+        })
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
