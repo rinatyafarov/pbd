@@ -14,8 +14,8 @@
 
     {% if games %}
 
-    <!-- Фильтры по статусу -->
-    <div class="filters-container" style="margin-bottom:1rem;">
+    <!-- Фильтры -->
+    <div class="filters-container" style="margin-bottom:1.5rem;">
         <div class="filter-group">
             <div class="filter-label">Статус:</div>
             <div class="filter-bar" id="status-filter-bar">
@@ -25,6 +25,30 @@
                 <button class="filter-btn" data-status="abandoned">✕ Сдался</button>
             </div>
         </div>
+
+        <div class="filter-group">
+            <div class="filter-label">Размер:</div>
+            <div class="size-filter-bar" id="size-filter-bar">
+                <button class="size-filter-btn active" data-size="all">Все</button>
+                <button class="size-filter-btn" data-size="3">3×3</button>
+                <button class="size-filter-btn" data-size="4">4×4</button>
+                <button class="size-filter-btn" data-size="5">5×5</button>
+                <button class="size-filter-btn" data-size="6">6×6</button>
+            </div>
+        </div>
+
+        <div class="filter-group">
+            <div class="filter-label">Сортировка:</div>
+            <select class="sort-select" id="sort-select">
+                <option value="date_desc">По дате (новые)</option>
+                <option value="date_asc">По дате (старые)</option>
+                <option value="steps_asc">По ходам (возр.)</option>
+                <option value="steps_desc">По ходам (убыв.)</option>
+                <option value="time_asc">По времени (возр.)</option>
+                <option value="time_desc">По времени (убыв.)</option>
+            </select>
+        </div>
+
         <div class="filter-stats" style="margin-top:0.5rem;">
             Показано <span id="shown-count">{{ games | length }}</span> из {{ games | length }}
         </div>
@@ -43,9 +67,15 @@
                     <th></th>
                 </tr>
             </thead>
-            <tbody>
+            <tbody id="games-table-body">
                 {% for g in games %}
-                <tr class="game-row" data-game-id="{{ g.session_id }}" data-status="{{ g.status }}">
+                <tr class="game-row" 
+                    data-game-id="{{ g.session_id }}" 
+                    data-status="{{ g.status }}"
+                    data-size="{{ g.grid_size }}"
+                    data-steps="{{ g.steps_count }}"
+                    data-time="{{ g.time_minutes or 0 }}"
+                    data-date="{{ g.start_time.strftime('%Y%m%d%H%M%S') if g.start_time else '0' }}">
                     <td>{{ g.start_time.strftime('%d.%m.%Y %H:%M') if g.start_time else '—' }}</td>
                     <td>{{ g.grid_size }}×{{ g.grid_size }}</td>
                     <td><span class="tag tag-{{ g.difficulty | lower }}">{{ g.difficulty }}</span></td>
@@ -79,27 +109,9 @@
         </table>
     </div>
 
-    <!-- Итоговая статистика -->
-    {% set solved_count    = games | selectattr('status','equalto','solved')   | list | length %}
-    {% set timeout_count   = games | selectattr('status','equalto','timeout')  | list | length %}
-    {% set abandoned_count = games | selectattr('status','equalto','abandoned')| list | length %}
-    <div class="stats-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1rem; margin-top:2rem;">
-        <div class="stat-card" style="text-align:center;">
-            <div class="stat-value" style="color:var(--easy);">{{ solved_count }}</div>
-            <div class="stat-label">Решено</div>
-        </div>
-        <div class="stat-card" style="text-align:center;">
-            <div class="stat-value" style="color:var(--hard);">{{ timeout_count }}</div>
-            <div class="stat-label">Таймаут</div>
-        </div>
-        <div class="stat-card" style="text-align:center;">
-            <div class="stat-value" style="color:var(--medium);">{{ abandoned_count }}</div>
-            <div class="stat-label">Сдался</div>
-        </div>
-        <div class="stat-card" style="text-align:center;">
-            <div class="stat-value">{{ games | map(attribute='steps_count') | sum }}</div>
-            <div class="stat-label">Всего ходов</div>
-        </div>
+    <!-- Итоговая статистика по фильтрам -->
+    <div class="stats-grid" id="stats-grid" style="display:grid; grid-template-columns:repeat(4,1fr); gap:1rem; margin-top:2rem;">
+        <!-- Заполняется динамически через JavaScript -->
     </div>
 
     {% else %}
@@ -113,8 +125,7 @@
 
 </section>
 
-
-<!-- ═══ Модальное окно: детали игры ════════════════════════════ -->
+<!-- Модальное окно: детали игры -->
 <div class="modal" id="game-details-modal" style="display:none">
     <div class="modal-card" style="max-width:560px; width:100%;">
         <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.2rem;">
@@ -132,26 +143,177 @@
 
 {% block scripts %}
 <script>
-// ── Фильтрация по статусу ────────────────────────────────────────
+// ── Фильтрация по статусу и размеру ───────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    const filterBtns = document.querySelectorAll('#status-filter-bar .filter-btn');
-    const rows       = document.querySelectorAll('.game-row');
-    const counter    = document.getElementById('shown-count');
+    const statusFilterBtns = document.querySelectorAll('#status-filter-bar .filter-btn');
+    const sizeFilterBtns = document.querySelectorAll('#size-filter-bar .size-filter-btn');
+    const sortSelect = document.getElementById('sort-select');
+    const tableBody = document.getElementById('games-table-body');
+    const rows = Array.from(document.querySelectorAll('.game-row'));
+    const counter = document.getElementById('shown-count');
+    const statsGrid = document.getElementById('stats-grid');
+    
+    let currentStatus = 'all';
+    let currentSize = 'all';
+    let currentSort = 'date_desc';
 
-    filterBtns.forEach(btn => {
+    function updateStats() {
+        const visibleRows = rows.filter(row => row.style.display !== 'none');
+        const solvedRows = visibleRows.filter(row => row.dataset.status === 'solved');
+        
+        // Вычисляем статистику
+        const totalGames = visibleRows.length;
+        const solvedGames = solvedRows.length;
+        
+        // Лучшее время и ходы среди решенных
+        let bestTime = Infinity;
+        let bestSteps = Infinity;
+        let totalSteps = 0;
+        
+        solvedRows.forEach(row => {
+            const steps = parseInt(row.dataset.steps);
+            const timeMinutes = parseFloat(row.dataset.time);
+            
+            totalSteps += steps;
+            
+            if (timeMinutes > 0) {
+                const totalSeconds = timeMinutes * 60;
+                if (totalSeconds < bestTime) bestTime = totalSeconds;
+            }
+            if (steps < bestSteps) bestSteps = steps;
+        });
+        
+        // Среднее количество ходов
+        const avgSteps = solvedRows.length > 0 ? Math.round(totalSteps / solvedRows.length) : 0;
+        
+        // Форматируем время
+        const formatTime = (seconds) => {
+            if (seconds === Infinity || !isFinite(seconds)) return '—';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        };
+        
+        // Обновляем статистику
+        statsGrid.innerHTML = `
+            <div class="stat-card" style="text-align:center; padding:1rem;">
+                <div class="stat-value" style="color:var(--accent); font-size:1.5rem;">${totalGames}</div>
+                <div class="stat-label">Всего игр</div>
+            </div>
+            <div class="stat-card" style="text-align:center; padding:1rem;">
+                <div class="stat-value" style="color:var(--easy); font-size:1.5rem;">${solvedGames}</div>
+                <div class="stat-label">Решено</div>
+            </div>
+            <div class="stat-card" style="text-align:center; padding:1rem;">
+                <div class="stat-value" style="color:var(--accent); font-size:1.5rem;">${bestSteps !== Infinity ? bestSteps : '—'}</div>
+                <div class="stat-label">Лучше ходов</div>
+            </div>
+            <div class="stat-card" style="text-align:center; padding:1rem;">
+                <div class="stat-value" style="color:var(--accent); font-size:1.5rem;">${formatTime(bestTime)}</div>
+                <div class="stat-label">Лучшее время</div>
+            </div>
+        `;
+    }
+
+    function sortRows(rowsToSort) {
+        const sortedRows = [...rowsToSort];
+        
+        switch(currentSort) {
+            case 'date_desc':
+                sortedRows.sort((a, b) => b.dataset.date.localeCompare(a.dataset.date));
+                break;
+            case 'date_asc':
+                sortedRows.sort((a, b) => a.dataset.date.localeCompare(b.dataset.date));
+                break;
+            case 'steps_asc':
+                sortedRows.sort((a, b) => parseInt(a.dataset.steps) - parseInt(b.dataset.steps));
+                break;
+            case 'steps_desc':
+                sortedRows.sort((a, b) => parseInt(b.dataset.steps) - parseInt(a.dataset.steps));
+                break;
+            case 'time_asc':
+                sortedRows.sort((a, b) => parseFloat(a.dataset.time) - parseFloat(b.dataset.time));
+                break;
+            case 'time_desc':
+                sortedRows.sort((a, b) => parseFloat(b.dataset.time) - parseFloat(a.dataset.time));
+                break;
+        }
+        
+        return sortedRows;
+    }
+
+    function filterAndSortGames() {
+        // Сначала фильтруем
+        const filteredRows = rows.filter(row => {
+            const status = row.dataset.status;
+            const size = row.dataset.size;
+            
+            const statusMatch = currentStatus === 'all' || status === currentStatus;
+            const sizeMatch = currentSize === 'all' || size === currentSize;
+            
+            return statusMatch && sizeMatch;
+        });
+        
+        // Потом сортируем
+        const sortedRows = sortRows(filteredRows);
+        
+        // Очищаем и заново заполняем таблицу
+        tableBody.innerHTML = '';
+        sortedRows.forEach(row => {
+            row.style.display = '';
+            tableBody.appendChild(row);
+        });
+        
+        // Обновляем счетчик
+        counter.textContent = sortedRows.length;
+        
+        // Обновляем статистику
+        updateStats();
+        
+        // Показываем сообщение, если ничего не найдено
+        const emptyMessage = document.querySelector('.empty-search');
+        if (sortedRows.length === 0 && rows.length > 0) {
+            if (!emptyMessage) {
+                const msg = document.createElement('div');
+                msg.className = 'empty-search';
+                msg.innerHTML = '<p style="text-align:center; padding:2rem; color:var(--text-muted);">Нет игр, соответствующих выбранным фильтрам</p>';
+                tableBody.parentElement.parentElement.appendChild(msg);
+            }
+        } else if (emptyMessage) {
+            emptyMessage.remove();
+        }
+    }
+
+    // Обработчики фильтров статуса
+    statusFilterBtns.forEach(btn => {
         btn.addEventListener('click', () => {
-            filterBtns.forEach(b => b.classList.remove('active'));
+            statusFilterBtns.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            const status = btn.dataset.status;
-            let visible = 0;
-            rows.forEach(row => {
-                const show = status === 'all' || row.dataset.status === status;
-                row.style.display = show ? '' : 'none';
-                if (show) visible++;
-            });
-            counter.textContent = visible;
+            currentStatus = btn.dataset.status;
+            filterAndSortGames();
         });
     });
+
+    // Обработчики фильтров размера
+    sizeFilterBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            sizeFilterBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentSize = btn.dataset.size;
+            filterAndSortGames();
+        });
+    });
+
+    // Обработчик сортировки
+    if (sortSelect) {
+        sortSelect.addEventListener('change', (e) => {
+            currentSort = e.target.value;
+            filterAndSortGames();
+        });
+    }
+
+    // Инициализация статистики
+    updateStats();
 
     // Закрытие модалки по клику на фон
     document.getElementById('game-details-modal').addEventListener('click', e => {
@@ -256,5 +418,61 @@ function exportGame(sessionId) {
 .error-text    { color:var(--hard); text-align:center; padding:1rem; }
 .stat-badge    { background:var(--surface2); padding:4px 12px; border-radius:20px;
                  font-size:0.8rem; color:var(--text-muted); }
+
+.filter-bar, .size-filter-bar {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.filter-btn, .size-filter-btn {
+    padding: 0.3rem 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+
+.filter-btn:hover, .size-filter-btn:hover {
+    background: var(--surface2);
+    border-color: var(--accent);
+}
+
+.filter-btn.active, .size-filter-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+}
+
+.sort-select {
+    padding: 0.3rem 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: var(--radius);
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.stat-card {
+    background: var(--surface2);
+    border-radius: var(--radius);
+    padding: 0.5rem;
+}
+
+.stat-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.stat-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+}
 </style>
 {% endblock %}

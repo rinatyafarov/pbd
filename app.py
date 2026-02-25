@@ -1212,7 +1212,7 @@ def undo_move():
 
 
 # ================================================================
-# ИГРА -- REDO (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ИГРА -- REDO
 # ================================================================
 
 @app.route("/game/redo", methods=["POST"])
@@ -1279,7 +1279,7 @@ def redo_move():
             print(f"ERROR: Next state is empty for attempt {attempt_id}, step {next_idx}")
             return jsonify({"error": "Следующее состояние повреждено (пустое)"}), 500
 
-        # Преобразуем target_state в строку - ИСПРАВЛЕНО
+        # Преобразуем target_state в строку
         target_state_str = read_clob(target_state)
 
         # Если target_state_str пустой или содержит только пробелы, пробуем получить его из PUZZLES еще раз
@@ -1553,52 +1553,7 @@ def diagnose_game():
 
 
 # ================================================================
-# ОТЛАДОЧНАЯ ФУНКЦИЯ
-# ================================================================
-
-@app.route("/game/debug", methods=["GET"])
-def debug_game():
-    """Отладочная функция для проверки состояния игры"""
-    if not get_current_user_id():
-        return jsonify({"error": "Не авторизован"}), 401
-
-    gsid = get_active_session_id()
-    if not gsid:
-        return jsonify({"error": "Нет активной игровой сессии"}), 400
-
-    try:
-        # Получаем информацию о попытке
-        attempt_data = db.fetch_one("""
-            SELECT GA.ID, GA.UNDO_POINTER, 
-                   SUBSTR(TO_CHAR(GA.CURRENT_STATE), 1, 100) as CURRENT_STATE_PREVIEW,
-                   GS.STEPS_COUNT
-            FROM GAME_ATTEMPTS GA
-            JOIN GAME_SESSIONS GS ON GA.SESSION_ID = GS.ID
-            WHERE GA.SESSION_ID = :1 AND ROWNUM = 1
-        """, [gsid])
-
-        # Получаем все шаги
-        steps = db.fetch_all("""
-            SELECT STEP_INDEX, IS_ACTUAL, TILE_VALUE,
-                   SUBSTR(TO_CHAR(STATE_AFTER), 1, 50) as STATE_PREVIEW
-            FROM GAME_STEPS
-            WHERE ATTEMPT_ID = :1
-            ORDER BY STEP_INDEX
-        """, [attempt_data["id"]])
-
-        return jsonify({
-            "session_id": gsid,
-            "attempt_id": attempt_data["id"],
-            "undo_pointer": attempt_data["undo_pointer"],
-            "steps_count": len(steps),
-            "steps": steps
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ================================================================
-# ТАБЛИЦА ЛИДЕРОВ
+# ТАБЛИЦА ЛИДЕРОВ (ОБНОВЛЕННАЯ С ФИЛЬТРАЦИЕЙ ПО РАЗМЕРУ)
 # ================================================================
 
 @app.route("/leaderboard")
@@ -1606,30 +1561,161 @@ def leaderboard():
     if not get_current_user_id():
         return redirect(url_for("login"))
 
-    players = db.fetch_all(
-        """SELECT U.ID, U.USERNAME,
-                  COUNT(DISTINCT GS.ID) AS TOTAL_GAMES,
-                  SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) AS SOLVED_GAMES,
-                  CASE 
-                      WHEN COUNT(DISTINCT GS.ID) > 0 
-                      THEN ROUND(SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) / 
-                           COUNT(DISTINCT GS.ID) * 100, 1)
-                      ELSE 0 
-                  END AS SUCCESS_RATE,
-                  ROUND(AVG(CASE WHEN GST.NAME = 'solved'
-                            THEN (GS.END_TIME - GS.START_TIME) * 24 * 60 END), 1) AS AVG_TIME_MINUTES,
-                  MIN(CASE WHEN GST.NAME = 'solved' THEN GS.STEPS_COUNT END) AS BEST_STEPS
-           FROM USERS U
-           LEFT JOIN GAME_SESSIONS GS ON U.ID = GS.USER_ID
-           LEFT JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
-           GROUP BY U.ID, U.USERNAME
-           ORDER BY SUCCESS_RATE DESC, SOLVED_GAMES DESC, AVG_TIME_MINUTES NULLS LAST"""
+    # Получаем параметр размера из запроса
+    grid_size = request.args.get('size', type=int)
+    sort_by = request.args.get('sort', 'success_rate')  # success_rate, best_time, best_steps
+
+    # Базовый запрос
+    base_query = """
+        SELECT U.ID, U.USERNAME,
+               COUNT(DISTINCT GS.ID) AS TOTAL_GAMES,
+               SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) AS SOLVED_GAMES,
+               CASE 
+                   WHEN COUNT(DISTINCT GS.ID) > 0 
+                   THEN ROUND(SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) / 
+                        COUNT(DISTINCT GS.ID) * 100, 1)
+                   ELSE 0 
+               END AS SUCCESS_RATE
+        FROM USERS U
+        LEFT JOIN GAME_SESSIONS GS ON U.ID = GS.USER_ID
+        LEFT JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+        LEFT JOIN PUZZLES PZ ON GS.PUZZLE_ID = PZ.ID
+        LEFT JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+        WHERE 1=1
+    """
+
+    params = []
+
+    # Добавляем фильтр по размеру, если указан
+    if grid_size:
+        base_query += " AND PS.GRID_SIZE = :1"
+        params.append(grid_size)
+
+    base_query += " GROUP BY U.ID, U.USERNAME"
+
+    # Получаем основную статистику
+    players = db.fetch_all(base_query, params if params else None)
+
+    # Для каждого игрока получаем дополнительную статистику по размерам
+    for player in players:
+        user_id = player["id"]
+
+        # Статистика по времени и ходам для конкретного размера (или для всех)
+        if grid_size:
+            # Для конкретного размера
+            stats = db.fetch_one("""
+                SELECT 
+                    ROUND(AVG(CASE WHEN GST.NAME = 'solved'
+                              THEN (GS.END_TIME - GS.START_TIME) * 24 * 60 * 60 END), 1) AS AVG_TIME_SECONDS,
+                    MIN(CASE WHEN GST.NAME = 'solved' THEN GS.STEPS_COUNT END) AS BEST_STEPS,
+                    MIN(CASE WHEN GST.NAME = 'solved' 
+                        THEN (GS.END_TIME - GS.START_TIME) * 24 * 60 * 60 END) AS BEST_TIME_SECONDS
+                FROM GAME_SESSIONS GS
+                JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+                JOIN PUZZLES PZ ON GS.PUZZLE_ID = PZ.ID
+                JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+                WHERE GS.USER_ID = :1 
+                  AND GST.NAME = 'solved'
+                  AND PS.GRID_SIZE = :2
+            """, [user_id, grid_size])
+        else:
+            # Для всех размеров
+            stats = db.fetch_one("""
+                SELECT 
+                    ROUND(AVG(CASE WHEN GST.NAME = 'solved'
+                              THEN (GS.END_TIME - GS.START_TIME) * 24 * 60 * 60 END), 1) AS AVG_TIME_SECONDS,
+                    MIN(CASE WHEN GST.NAME = 'solved' THEN GS.STEPS_COUNT END) AS BEST_STEPS,
+                    MIN(CASE WHEN GST.NAME = 'solved' 
+                        THEN (GS.END_TIME - GS.START_TIME) * 24 * 60 * 60 END) AS BEST_TIME_SECONDS
+                FROM GAME_SESSIONS GS
+                JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+                WHERE GS.USER_ID = :1 AND GST.NAME = 'solved'
+            """, [user_id])
+
+        player["avg_time_seconds"] = stats["avg_time_seconds"] if stats else None
+        player["best_steps"] = stats["best_steps"] if stats else None
+        player["best_time_seconds"] = stats["best_time_seconds"] if stats else None
+
+    # Сортируем в зависимости от выбранного критерия
+    if sort_by == 'best_time':
+        players.sort(key=lambda x: (x["best_time_seconds"] is None, x["best_time_seconds"] or float('inf')))
+    elif sort_by == 'best_steps':
+        players.sort(key=lambda x: (x["best_steps"] is None, x["best_steps"] or float('inf')))
+    else:  # success_rate
+        players.sort(key=lambda x: (-x["success_rate"], -x["solved_games"]))
+
+    # Получаем список всех доступных размеров для фильтра
+    sizes = db.fetch_all(
+        "SELECT GRID_SIZE FROM PUZZLE_SIZES ORDER BY GRID_SIZE"
     )
-    return render_template("leaderboard.html", players=players, username=session.get("username"))
+
+    return render_template(
+        "leaderboard.html",
+        players=players,
+        username=session.get("username"),
+        current_size=grid_size,
+        current_sort=sort_by,
+        sizes=sizes
+    )
 
 
 # ================================================================
-# ИСТОРИЯ
+# API ДЛЯ ПОЛУЧЕНИЯ ТОП-10 ПО РАЗМЕРУ (для графиков)
+# ================================================================
+
+@app.route("/api/leaderboard/<int:grid_size>")
+def api_leaderboard_by_size(grid_size):
+    """Возвращает топ-10 игроков для конкретного размера поля"""
+    if not get_current_user_id():
+        return jsonify({"error": "Не авторизован"}), 401
+
+    # Топ по времени
+    time_top = db.fetch_all("""
+        SELECT * FROM (
+            SELECT 
+                U.USERNAME,
+                ROUND((GS.END_TIME - GS.START_TIME) * 24 * 60 * 60, 1) AS TIME_SECONDS,
+                GS.STEPS_COUNT,
+                ROW_NUMBER() OVER (ORDER BY (GS.END_TIME - GS.START_TIME)) AS RN
+            FROM GAME_SESSIONS GS
+            JOIN USERS U ON GS.USER_ID = U.ID
+            JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+            JOIN PUZZLES PZ ON GS.PUZZLE_ID = PZ.ID
+            JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+            WHERE GST.NAME = 'solved' AND PS.GRID_SIZE = :1
+        )
+        WHERE RN <= 10
+        ORDER BY RN
+    """, [grid_size])
+
+    # Топ по ходам
+    steps_top = db.fetch_all("""
+        SELECT * FROM (
+            SELECT 
+                U.USERNAME,
+                GS.STEPS_COUNT,
+                ROUND((GS.END_TIME - GS.START_TIME) * 24 * 60 * 60, 1) AS TIME_SECONDS,
+                ROW_NUMBER() OVER (ORDER BY GS.STEPS_COUNT) AS RN
+            FROM GAME_SESSIONS GS
+            JOIN USERS U ON GS.USER_ID = U.ID
+            JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+            JOIN PUZZLES PZ ON GS.PUZZLE_ID = PZ.ID
+            JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+            WHERE GST.NAME = 'solved' AND PS.GRID_SIZE = :1
+        )
+        WHERE RN <= 10
+        ORDER BY RN
+    """, [grid_size])
+
+    return jsonify({
+        "grid_size": grid_size,
+        "by_time": time_top,
+        "by_steps": steps_top
+    })
+
+
+# ================================================================
+# ИСТОРИЯ (ИСПРАВЛЕННАЯ)
 # ================================================================
 
 @app.route("/history")
@@ -1638,6 +1724,8 @@ def history():
         return redirect(url_for("login"))
 
     user_id = get_current_user_id()
+
+    # Получаем все игры пользователя - убираем EXTRACT для сортировки
     games = db.fetch_all(
         """SELECT GS.ID AS SESSION_ID, GS.START_TIME, GS.END_TIME,
                   GST.NAME AS STATUS, GS.STEPS_COUNT,
@@ -1652,11 +1740,53 @@ def history():
            ORDER BY GS.START_TIME DESC""",
         [user_id]
     )
-    return render_template("history.html", games=games, username=session.get("username"))
+
+    # Получаем статистику по размерам для текущего пользователя
+    size_stats = db.fetch_all(
+        """SELECT 
+                  PS.GRID_SIZE,
+                  COUNT(*) AS TOTAL_GAMES,
+                  SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) AS SOLVED_GAMES,
+                  MIN(CASE WHEN GST.NAME = 'solved' THEN GS.STEPS_COUNT END) AS BEST_STEPS,
+                  MIN(CASE WHEN GST.NAME = 'solved' 
+                      THEN ROUND((GS.END_TIME - GS.START_TIME)*24*60*60, 1) END) AS BEST_TIME_SECONDS
+           FROM GAME_SESSIONS GS
+           JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+           JOIN PUZZLES PZ ON GS.PUZZLE_ID = PZ.ID
+           JOIN PUZZLE_SIZES PS ON PZ.PUZZLE_SIZE_ID = PS.ID
+           WHERE GS.USER_ID = :1 AND GST.NAME != 'active'
+           GROUP BY PS.GRID_SIZE
+           ORDER BY PS.GRID_SIZE""",
+        [user_id]
+    )
+
+    # Получаем общую статистику
+    total_stats = db.fetch_one(
+        """SELECT 
+                  COUNT(*) AS TOTAL_GAMES,
+                  SUM(CASE WHEN GST.NAME = 'solved' THEN 1 ELSE 0 END) AS SOLVED_GAMES,
+                  SUM(CASE WHEN GST.NAME = 'timeout' THEN 1 ELSE 0 END) AS TIMEOUT_GAMES,
+                  SUM(CASE WHEN GST.NAME = 'abandoned' THEN 1 ELSE 0 END) AS ABANDONED_GAMES,
+                  MIN(CASE WHEN GST.NAME = 'solved' THEN GS.STEPS_COUNT END) AS BEST_STEPS_ALL,
+                  MIN(CASE WHEN GST.NAME = 'solved' 
+                      THEN ROUND((GS.END_TIME - GS.START_TIME)*24*60*60, 1) END) AS BEST_TIME_ALL
+           FROM GAME_SESSIONS GS
+           JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
+           WHERE GS.USER_ID = :1 AND GST.NAME != 'active'""",
+        [user_id]
+    )
+
+    return render_template(
+        "history.html",
+        games=games,
+        size_stats=size_stats,
+        total_stats=total_stats,
+        username=session.get("username")
+    )
 
 
 # ================================================================
-# ИСТОРИЯ -- ДЕТАЛИ ИГРЫ (AJAX)
+# ИСТОРИЯ -- ДЕТАЛИ ИГРЫ (AJAX) - ОБНОВЛЕННАЯ
 # ================================================================
 
 @app.route("/history/game/<int:session_id>")
@@ -1672,6 +1802,7 @@ def game_details(session_id):
                   GST.NAME AS STATUS, GS.STEPS_COUNT,
                   PS.GRID_SIZE, DL.NAME AS DIFFICULTY,
                   ROUND((GS.END_TIME - GS.START_TIME)*24*60, 1) AS TIME_MINUTES,
+                  ROUND((GS.END_TIME - GS.START_TIME)*24*60*60, 1) AS TIME_SECONDS,
                   PZ.SEED
            FROM GAME_SESSIONS GS
            JOIN GAME_STATUSES GST ON GS.STATUS_ID = GST.ID
@@ -1685,7 +1816,7 @@ def game_details(session_id):
     if not game:
         return jsonify({"error": "Игра не найдена"}), 404
 
-    # История ходов
+    # История ходов с описанием
     steps = db.fetch_all(
         """SELECT GS.STEP_INDEX, AT.NAME AS ACTION,
                   GS.TILE_VALUE, GS.DIRECTION, GS.STEP_TIME, GS.IS_ACTUAL
@@ -1714,12 +1845,26 @@ def game_details(session_id):
             return d.strftime("%H:%M:%S")
         return str(d)
 
+    def fmt_time_display(minutes):
+        if not minutes:
+            return "--:--"
+        m = int(minutes)
+        s = int((minutes - m) * 60)
+        return f"{m:02d}:{s:02d}"
+
     steps_list = []
     for s in steps:
         step_time = s["step_time"]
+        # Создаем описание хода
+        if s["action"] == 'move' and s["tile_value"]:
+            desc = f"Плитка {s['tile_value']}"
+        else:
+            desc = s["action"].capitalize()
+
         steps_list.append({
             "index": s["step_index"],
             "action": s["action"],
+            "desc": desc,
             "tile": s["tile_value"],
             "direction": s["direction"],
             "time": fmt_time(step_time),
@@ -1730,10 +1875,12 @@ def game_details(session_id):
         "start_time": fmt_date(start_time),
         "end_time": fmt_date(end_time),
         "status": game["status"],
+        "status_raw": game["status"],
         "steps_count": game["steps_count"],
         "grid_size": game["grid_size"],
         "difficulty": game["difficulty"],
         "time_minutes": game["time_minutes"],
+        "time_str": fmt_time_display(game["time_minutes"]),
         "seed": game["seed"],
         "steps": steps_list,
     })

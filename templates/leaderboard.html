@@ -5,7 +5,44 @@
 {% block content %}
 
 <section class="section">
-    <h2 class="section-title">Таблица лидеров</h2>
+    <div class="section-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
+        <h2 class="section-title" style="margin-bottom:0;">Таблица лидеров</h2>
+        
+        <!-- Фильтр по размеру поля - сдвинут вправо -->
+        <div class="filter-group" style="display:flex; gap:1rem; align-items:center; margin-left:auto;">
+            <div class="filter-label" style="font-weight:500; color:var(--text-muted);">Размер поля:</div>
+            <div class="size-filter-bar" id="size-filter-bar">
+                <a href="{{ url_for('leaderboard', sort=current_sort) }}" 
+                   class="size-filter-btn {% if not current_size %}active{% endif %}">
+                    Все
+                </a>
+                {% for size in sizes %}
+                    {% if size.grid_size <= 6 %}  <!-- Фильтруем только размеры до 6 -->
+                    <a href="{{ url_for('leaderboard', size=size.grid_size, sort=current_sort) }}" 
+                       class="size-filter-btn {% if current_size == size.grid_size %}active{% endif %}">
+                        {{ size.grid_size }}×{{ size.grid_size }}
+                    </a>
+                    {% endif %}
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Переключатель между таблицами -->
+    <div class="tab-bar" style="display:flex; gap:0.5rem; margin-bottom:1.5rem; border-bottom:2px solid var(--border);">
+        <button class="tab-btn {% if current_sort == 'success_rate' %}active{% endif %}" 
+                onclick="window.location.href='{{ url_for('leaderboard', size=current_size, sort='success_rate') }}'">
+            📊 По успешности
+        </button>
+        <button class="tab-btn {% if current_sort == 'best_time' %}active{% endif %}"
+                onclick="window.location.href='{{ url_for('leaderboard', size=current_size, sort='best_time') }}'">
+            ⏱ Лучшее время
+        </button>
+        <button class="tab-btn {% if current_sort == 'best_steps' %}active{% endif %}"
+                onclick="window.location.href='{{ url_for('leaderboard', size=current_size, sort='best_steps') }}'">
+            🎯 Минимум ходов
+        </button>
+    </div>
 
     {% if players %}
     <div class="table-wrap">
@@ -17,8 +54,17 @@
                     <th>Игр</th>
                     <th>Решено</th>
                     <th>Успех %</th>
-                    <th>Среднее время (мин)</th>
-                    <th>Лучший результат (ходов)</th>
+                    
+                    {% if current_sort == 'best_time' %}
+                    <th>Лучшее время</th>
+                    <th>Ходов</th>
+                    {% elif current_sort == 'best_steps' %}
+                    <th>Лучшее ходов</th>
+                    <th>Время</th>
+                    {% else %}
+                    <th>Среднее время</th>
+                    <th>Лучший результат</th>
+                    {% endif %}
                 </tr>
             </thead>
             <tbody>
@@ -39,17 +85,203 @@
                             <span>{{ p.success_rate or 0 }}%</span>
                         </div>
                     </td>
-                    <td>{{ p.avg_time_minutes or '—' }}</td>
+                    
+                    {% if current_sort == 'best_time' %}
+                    <td>
+                        {% if p.best_time_seconds %}
+                            {% set minutes = (p.best_time_seconds // 60) | int %}
+                            {% set seconds = (p.best_time_seconds % 60) | int %}
+                            <span class="time-display">{{ "%02d:%02d"|format(minutes, seconds) }}</span>
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if p.best_time_seconds %}
+                            <strong>{{ p.best_steps or '—' }}</strong>
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    {% elif current_sort == 'best_steps' %}
+                    <td>
+                        {% if p.best_steps %}
+                            <strong>{{ p.best_steps }}</strong>
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if p.best_steps and p.best_time_seconds %}
+                            {% set minutes = (p.best_time_seconds // 60) | int %}
+                            {% set seconds = (p.best_time_seconds % 60) | int %}
+                            <span class="time-display">{{ "%02d:%02d"|format(minutes, seconds) }}</span>
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    {% else %}
+                    <td>
+                        {% if p.avg_time_seconds %}
+                            {% set minutes = (p.avg_time_seconds // 60) | int %}
+                            {% set seconds = (p.avg_time_seconds % 60) | int %}
+                            <span class="time-display">{{ "%02d:%02d"|format(minutes, seconds) }}</span>
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
                     <td>{{ p.best_steps or '—' }}</td>
+                    {% endif %}
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
+
+    <!-- Дополнительная статистика по размеру -->
+    {% if current_size %}
+    <div class="stats-grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin-top:2rem;">
+        <div class="stat-card" style="text-align:center; padding:1rem;">
+            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+                {% set best_time = players | selectattr('best_time_seconds') | map(attribute='best_time_seconds') | min %}
+                {% if best_time %}
+                    {% set minutes = (best_time // 60) | int %}
+                    {% set seconds = (best_time % 60) | int %}
+                    {{ "%02d:%02d"|format(minutes, seconds) }}
+                {% else %}
+                    —
+                {% endif %}
+            </div>
+            <div class="stat-label">Лучшее время</div>
+        </div>
+        <div class="stat-card" style="text-align:center; padding:1rem;">
+            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+                {{ players | selectattr('best_steps') | map(attribute='best_steps') | min | default('—') }}
+            </div>
+            <div class="stat-label">Минимум ходов</div>
+        </div>
+        <div class="stat-card" style="text-align:center; padding:1rem;">
+            <div class="stat-value" style="color:var(--accent); font-size:1.8rem;">
+                {{ players | selectattr('success_rate') | map(attribute='success_rate') | max | round(1) }}%
+            </div>
+            <div class="stat-label">Макс. успешность</div>
+        </div>
+    </div>
+    {% endif %}
+
     {% else %}
-    <p class="empty-state">Пока никто не сыграл ни одной игры.</p>
+    <div class="empty-state">
+        <div class="empty-icon">🏆</div>
+        <h3>Пока нет результатов</h3>
+        <p>Сыграйте первую игру, чтобы попасть в таблицу лидеров!</p>
+        <a href="{{ url_for('index') }}" class="btn btn-primary" style="margin-top:1rem;">К каталогу игр</a>
+    </div>
     {% endif %}
 
 </section>
+
+<style>
+.tab-bar {
+    display: flex;
+    gap: 0.5rem;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 0.5rem;
+}
+
+.tab-btn {
+    background: none;
+    border: none;
+    padding: 0.5rem 1.2rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: var(--radius) var(--radius) 0 0;
+    transition: all 0.2s;
+    font-family: var(--font-mono);
+}
+
+.tab-btn:hover {
+    color: var(--accent);
+    background: var(--surface2);
+}
+
+.tab-btn.active {
+    color: var(--accent);
+    background: var(--surface2);
+    border-bottom: 2px solid var(--accent);
+    margin-bottom: -2px;
+}
+
+.time-display {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.size-filter-bar {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.size-filter-btn {
+    padding: 0.3rem 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 0.85rem;
+    text-decoration: none;
+    transition: all 0.2s;
+}
+
+.size-filter-btn:hover {
+    background: var(--surface2);
+    border-color: var(--accent);
+}
+
+.size-filter-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+}
+
+.stat-card {
+    background: var(--surface2);
+    border-radius: var(--radius);
+    padding: 1rem;
+}
+
+.stat-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    line-height: 1.2;
+}
+
+.stat-label {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    margin-top: 0.3rem;
+}
+
+/* Стили для заголовка */
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+}
+
+.section-title {
+    margin-bottom: 0;
+}
+
+.filter-label {
+    font-weight: 500;
+    color: var(--text-muted);
+}
+</style>
 
 {% endblock %}
